@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "courseId": 2073,
+  "repository": "LearningOS/2026a-rcore-crion99",
+  "user": "crion99",
+  "totalScore": 500,
+  "chapters": {
+    "ch3": {
+      "points": "7/7",
+      "score": 100,
+      "commit": "994940cf854dd9182f2d604edf10cdf58375c232"
+    }
+  },
+  "score": 100,
+  "upload": {
+    "status": "pending",
+    "runId": "43616596235",
+    "runAttempt": "1"
+  }
+}
