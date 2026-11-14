@@ -17,11 +17,18 @@ mod task;
 use crate::config::MAX_APP_NUM;
 use crate::loader::{get_num_app, init_app_cx};
 use crate::sync::UPSafeCell;
+use alloc::{vec, vec::Vec};
 use lazy_static::*;
 use switch::__switch;
 pub use task::{TaskControlBlock, TaskStatus};
 
 pub use context::TaskContext;
+
+/// Number of syscall slots tracked for every task.
+///
+/// The largest syscall number used by this chapter is `trace` (410).  Keeping
+/// a small fixed-size table makes accounting allocation-free in the kernel.
+const MAX_SYSCALL_NUM: usize = 512;
 
 /// The task manager, where all the tasks are managed.
 ///
@@ -45,6 +52,8 @@ pub struct TaskManagerInner {
     tasks: [TaskControlBlock; MAX_APP_NUM],
     /// id of current `Running` task
     current_task: usize,
+    /// syscall invocation counters, indexed by task id and syscall id
+    syscall_times: Vec<Vec<usize>>,
 }
 
 lazy_static! {
@@ -65,6 +74,11 @@ lazy_static! {
                 UPSafeCell::new(TaskManagerInner {
                     tasks,
                     current_task: 0,
+                    // Allocate rows separately so this 64 KiB table is not
+                    // materialized on the 8 KiB kernel boot stack.
+                    syscall_times: (0..MAX_APP_NUM)
+                        .map(|_| vec![0; MAX_SYSCALL_NUM])
+                        .collect(),
                 })
             },
         }
@@ -72,6 +86,24 @@ lazy_static! {
 }
 
 impl TaskManager {
+    /// Record one syscall made by the currently running task.
+    fn count_syscall(&self, syscall_id: usize) {
+        if syscall_id < MAX_SYSCALL_NUM {
+            let mut inner = self.inner.exclusive_access();
+            let current = inner.current_task;
+            inner.syscall_times[current][syscall_id] += 1;
+        }
+    }
+
+    /// Return the current task's invocation count for a syscall.
+    fn syscall_count(&self, syscall_id: usize) -> Option<usize> {
+        if syscall_id >= MAX_SYSCALL_NUM {
+            return None;
+        }
+        let inner = self.inner.exclusive_access();
+        Some(inner.syscall_times[inner.current_task][syscall_id])
+    }
+
     /// Run the first task in task list.
     ///
     /// Generally, the first task in task list is an idle task (we call it zero process later).
@@ -140,6 +172,16 @@ impl TaskManager {
 /// Run the first task in task list.
 pub fn run_first_task() {
     TASK_MANAGER.run_first_task();
+}
+
+/// Record one syscall made by the current task.
+pub fn count_syscall(syscall_id: usize) {
+    TASK_MANAGER.count_syscall(syscall_id);
+}
+
+/// Query the current task's invocation count for a syscall.
+pub fn syscall_count(syscall_id: usize) -> Option<usize> {
+    TASK_MANAGER.syscall_count(syscall_id)
 }
 
 /// Switch current `Running` task to the task we have found,
