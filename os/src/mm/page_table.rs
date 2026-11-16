@@ -1,6 +1,7 @@
 //! Implementation of [`PageTableEntry`] and [`PageTable`].
 
 use super::{frame_alloc, FrameTracker, PhysPageNum, StepByOne, VirtAddr, VirtPageNum};
+use crate::config::PAGE_SIZE;
 use alloc::vec;
 use alloc::vec::Vec;
 use bitflags::*;
@@ -178,4 +179,44 @@ pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Vec<&
         start = end_va.into();
     }
     v
+}
+
+/// Translate a user buffer after checking that every covered page is valid,
+/// user-accessible, and has the requested read/write permission.
+pub fn translated_user_buffer(
+    token: usize,
+    ptr: *const u8,
+    len: usize,
+    writable: bool,
+) -> Option<Vec<&'static mut [u8]>> {
+    let page_table = PageTable::from_token(token);
+    let mut start = ptr as usize;
+    let end = start.checked_add(len)?;
+    // Userspace in this kernel occupies only canonical Sv39 lower-half VAs.
+    if end > (1usize << 38) {
+        return None;
+    }
+    let mut buffers = Vec::new();
+    while start < end {
+        let start_va = VirtAddr::from(start);
+        let vpn = start_va.floor();
+        let pte = page_table.translate(vpn)?;
+        let flags = pte.flags();
+        let permitted = pte.is_valid()
+            && flags.contains(PTEFlags::U)
+            && if writable {
+                flags.contains(PTEFlags::W)
+            } else {
+                flags.contains(PTEFlags::R)
+            };
+        if !permitted {
+            return None;
+        }
+        let ppn = pte.ppn();
+        let offset = start_va.page_offset();
+        let bytes = (PAGE_SIZE - offset).min(end - start);
+        buffers.push(&mut ppn.get_bytes_array()[offset..offset + bytes]);
+        start += bytes;
+    }
+    Some(buffers)
 }

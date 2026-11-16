@@ -15,6 +15,7 @@ mod switch;
 mod task;
 
 use crate::loader::{get_app_data, get_num_app};
+use crate::mm::{MapPermission, VirtAddr};
 use crate::sync::UPSafeCell;
 use crate::trap::TrapContext;
 use alloc::vec::Vec;
@@ -23,6 +24,9 @@ use switch::__switch;
 pub use task::{TaskControlBlock, TaskStatus};
 
 pub use context::TaskContext;
+
+/// Number of syscall identifiers tracked for each task.
+const MAX_SYSCALL_NUM: usize = 512;
 
 /// The task manager, where all the tasks are managed.
 ///
@@ -46,6 +50,8 @@ struct TaskManagerInner {
     tasks: Vec<TaskControlBlock>,
     /// id of current `Running` task
     current_task: usize,
+    /// syscall counters indexed by task id and syscall id
+    syscall_times: Vec<Vec<usize>>,
 }
 
 lazy_static! {
@@ -64,6 +70,9 @@ lazy_static! {
                 UPSafeCell::new(TaskManagerInner {
                     tasks,
                     current_task: 0,
+                    syscall_times: (0..num_app)
+                        .map(|_| alloc::vec![0; MAX_SYSCALL_NUM])
+                        .collect(),
                 })
             },
         }
@@ -71,6 +80,38 @@ lazy_static! {
 }
 
 impl TaskManager {
+    /// Count one syscall for the current task.
+    fn count_syscall(&self, syscall_id: usize) {
+        if syscall_id < MAX_SYSCALL_NUM {
+            let mut inner = self.inner.exclusive_access();
+            let current = inner.current_task;
+            inner.syscall_times[current][syscall_id] += 1;
+        }
+    }
+
+    /// Query the current task's syscall count.
+    fn syscall_count(&self, syscall_id: usize) -> Option<usize> {
+        if syscall_id >= MAX_SYSCALL_NUM {
+            return None;
+        }
+        let inner = self.inner.exclusive_access();
+        Some(inner.syscall_times[inner.current_task][syscall_id])
+    }
+
+    /// Add an anonymous mapping to the current task.
+    fn mmap_current(&self, start: VirtAddr, end: VirtAddr, permission: MapPermission) -> bool {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current].memory_set.mmap(start, end, permission)
+    }
+
+    /// Remove an anonymous mapping from the current task.
+    fn munmap_current(&self, start: VirtAddr, end: VirtAddr) -> bool {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current].memory_set.munmap(start, end)
+    }
+
     /// Run the first task in task list.
     ///
     /// Generally, the first task in task list is an idle task (we call it zero process later).
@@ -158,6 +199,26 @@ impl TaskManager {
 /// Run the first task in task list.
 pub fn run_first_task() {
     TASK_MANAGER.run_first_task();
+}
+
+/// Record a syscall made by the current task.
+pub fn count_syscall(syscall_id: usize) {
+    TASK_MANAGER.count_syscall(syscall_id);
+}
+
+/// Return the current task's count for a syscall identifier.
+pub fn syscall_count(syscall_id: usize) -> Option<usize> {
+    TASK_MANAGER.syscall_count(syscall_id)
+}
+
+/// Add an anonymous mapping to the current task.
+pub fn mmap_current(start: VirtAddr, end: VirtAddr, permission: MapPermission) -> bool {
+    TASK_MANAGER.mmap_current(start, end, permission)
+}
+
+/// Remove an anonymous mapping from the current task.
+pub fn munmap_current(start: VirtAddr, end: VirtAddr) -> bool {
+    TASK_MANAGER.munmap_current(start, end)
 }
 
 /// Switch current `Running` task to the task we have found,
