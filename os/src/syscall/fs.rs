@@ -1,6 +1,6 @@
 //! File and filesystem-related syscalls
-use crate::fs::{open_file, OpenFlags, Stat};
-use crate::mm::{translated_byte_buffer, translated_str, UserBuffer};
+use crate::fs::{link_file, open_file, unlink_file, OpenFlags, Stat};
+use crate::mm::{translated_byte_buffer, translated_str, translated_user_buffer, UserBuffer};
 use crate::task::{current_task, current_user_token};
 
 pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> isize {
@@ -75,29 +75,62 @@ pub fn sys_close(fd: usize) -> isize {
     0
 }
 
-/// YOUR JOB: Implement fstat.
-pub fn sys_fstat(_fd: usize, _st: *mut Stat) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_fstat NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// Return metadata for an inode-backed file descriptor.
+pub fn sys_fstat(fd: usize, st: *mut Stat) -> isize {
+    trace!("kernel:pid[{}] sys_fstat", current_task().unwrap().pid.0);
+    let task = current_task().unwrap();
+    let inner = task.inner_exclusive_access();
+    let Some(Some(file)) = inner.fd_table.get(fd) else {
+        return -1;
+    };
+    let file = file.clone();
+    drop(inner);
+    let Some(stat) = file.stat() else {
+        return -1;
+    };
+    let source = unsafe {
+        core::slice::from_raw_parts(
+            (&stat as *const Stat).cast::<u8>(),
+            core::mem::size_of::<Stat>(),
+        )
+    };
+    let Some(buffers) = translated_user_buffer(
+        current_user_token(),
+        st.cast::<u8>(),
+        core::mem::size_of::<Stat>(),
+        true,
+    ) else {
+        return -1;
+    };
+    let mut copied = 0;
+    for buffer in buffers {
+        let next = copied + buffer.len();
+        buffer.copy_from_slice(&source[copied..next]);
+        copied = next;
+    }
+    0
 }
 
-/// YOUR JOB: Implement linkat.
-pub fn sys_linkat(_old_name: *const u8, _new_name: *const u8) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_linkat NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// Create a hard link between two root-directory names.
+pub fn sys_linkat(old_name: *const u8, new_name: *const u8) -> isize {
+    trace!("kernel:pid[{}] sys_linkat", current_task().unwrap().pid.0);
+    let token = current_user_token();
+    let old_name = translated_str(token, old_name);
+    let new_name = translated_str(token, new_name);
+    if link_file(old_name.as_str(), new_name.as_str()) {
+        0
+    } else {
+        -1
+    }
 }
 
-/// YOUR JOB: Implement unlinkat.
-pub fn sys_unlinkat(_name: *const u8) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_unlinkat NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// Remove one hard link from the root directory.
+pub fn sys_unlinkat(name: *const u8) -> isize {
+    trace!("kernel:pid[{}] sys_unlinkat", current_task().unwrap().pid.0);
+    let name = translated_str(current_user_token(), name);
+    if unlink_file(name.as_str()) {
+        0
+    } else {
+        -1
+    }
 }

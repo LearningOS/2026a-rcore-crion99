@@ -11,6 +11,11 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefMut;
 
+/// Default process priority used by stride scheduling.
+pub const DEFAULT_PRIORITY: usize = 16;
+/// Numerator used to derive a process's stride pass from its priority.
+pub const BIG_STRIDE: usize = usize::MAX;
+
 /// Task control block structure
 ///
 /// Directly save the contents that will not change during running
@@ -35,6 +40,27 @@ impl TaskControlBlock {
     pub fn get_user_token(&self) -> usize {
         let inner = self.inner_exclusive_access();
         inner.memory_set.token()
+    }
+
+    /// Return the process's current scheduling stride.
+    pub fn stride(&self) -> usize {
+        self.inner_exclusive_access().stride
+    }
+
+    /// Charge one scheduling pass to this process.
+    pub fn advance_stride(&self) {
+        let mut inner = self.inner_exclusive_access();
+        let pass = BIG_STRIDE / inner.priority;
+        inner.stride = inner.stride.wrapping_add(pass);
+    }
+
+    /// Set the process priority, rejecting values unsupported by stride.
+    pub fn set_priority(&self, priority: isize) -> isize {
+        if priority < 2 {
+            return -1;
+        }
+        self.inner_exclusive_access().priority = priority as usize;
+        priority
     }
 }
 
@@ -71,6 +97,12 @@ pub struct TaskControlBlockInner {
 
     /// Program break
     pub program_brk: usize,
+
+    /// Accumulated stride used to choose the next runnable process
+    pub stride: usize,
+
+    /// Scheduling priority; larger values receive proportionally more CPU time
+    pub priority: usize,
 }
 
 impl TaskControlBlockInner {
@@ -135,6 +167,8 @@ impl TaskControlBlock {
                     ],
                     heap_bottom: user_sp,
                     program_brk: user_sp,
+                    stride: 0,
+                    priority: DEFAULT_PRIORITY,
                 })
             },
         };
@@ -216,6 +250,8 @@ impl TaskControlBlock {
                     fd_table: new_fd_table,
                     heap_bottom: parent_inner.heap_bottom,
                     program_brk: parent_inner.program_brk,
+                    stride: parent_inner.stride,
+                    priority: parent_inner.priority,
                 })
             },
         });
@@ -234,6 +270,14 @@ impl TaskControlBlock {
     /// get pid of process
     pub fn getpid(&self) -> usize {
         self.pid.0
+    }
+
+    /// Create a child directly from an ELF image without copying this process.
+    pub fn spawn(self: &Arc<Self>, elf_data: &[u8]) -> Arc<Self> {
+        let child = Arc::new(TaskControlBlock::new(elf_data));
+        child.inner_exclusive_access().parent = Some(Arc::downgrade(self));
+        self.inner_exclusive_access().children.push(child.clone());
+        child
     }
 
     /// change the location of the program break. return None if failed.

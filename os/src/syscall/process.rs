@@ -3,13 +3,18 @@
 use alloc::sync::Arc;
 
 use crate::{
+    config::PAGE_SIZE,
     fs::{open_file, OpenFlags},
-    mm::{translated_refmut, translated_str},
+    mm::{translated_refmut, translated_str, translated_user_buffer, MapPermission, VirtAddr},
     task::{
         add_task, current_task, current_user_token, exit_current_and_run_next,
         suspend_current_and_run_next,
     },
+    timer::get_time_us,
 };
+
+/// End of the canonical lower-half user address range in Sv39.
+const USER_VA_LIMIT: usize = 1usize << 38;
 
 #[repr(C)]
 #[derive(Debug)]
@@ -102,33 +107,112 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
     // ---- release current PCB automatically
 }
 
-/// YOUR JOB: get time with second and microsecond
-/// HINT: You might reimplement it with virtual memory management.
-/// HINT: What if [`TimeVal`] is splitted by two pages ?
-pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// Get time through the current process's page table, including split buffers.
+pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
+    trace!("kernel:pid[{}] sys_get_time", current_task().unwrap().pid.0);
+    let us = get_time_us();
+    let value = TimeVal {
+        sec: us / 1_000_000,
+        usec: us % 1_000_000,
+    };
+    let source = unsafe {
+        core::slice::from_raw_parts(
+            (&value as *const TimeVal).cast::<u8>(),
+            core::mem::size_of::<TimeVal>(),
+        )
+    };
+    let Some(buffers) = translated_user_buffer(
+        current_user_token(),
+        ts.cast::<u8>(),
+        core::mem::size_of::<TimeVal>(),
+        true,
+    ) else {
+        return -1;
+    };
+    let mut copied = 0;
+    for buffer in buffers {
+        let next = copied + buffer.len();
+        buffer.copy_from_slice(&source[copied..next]);
+        copied = next;
+    }
+    0
 }
 
-/// YOUR JOB: Implement mmap.
-pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_mmap NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
+/// Map anonymous pages in the current process.
+pub fn sys_mmap(start: usize, len: usize, prot: usize) -> isize {
+    trace!("kernel:pid[{}] sys_mmap", current_task().unwrap().pid.0);
+    if start % PAGE_SIZE != 0 || prot == 0 || prot & !0x7 != 0 {
+        return -1;
+    }
+    if len == 0 {
+        return 0;
+    }
+    let Some(raw_end) = start.checked_add(len) else {
+        return -1;
+    };
+    let Some(end) = raw_end
+        .checked_add(PAGE_SIZE - 1)
+        .map(|value| value / PAGE_SIZE * PAGE_SIZE)
+    else {
+        return -1;
+    };
+    if end > USER_VA_LIMIT {
+        return -1;
+    }
+    let mut permission = MapPermission::empty();
+    if prot & 0x1 != 0 {
+        permission |= MapPermission::R;
+    }
+    if prot & 0x2 != 0 {
+        permission |= MapPermission::W;
+    }
+    if prot & 0x4 != 0 {
+        permission |= MapPermission::X;
+    }
+    let task = current_task().unwrap();
+    let result = task.inner_exclusive_access().memory_set.mmap(
+        VirtAddr::from(start),
+        VirtAddr::from(end),
+        permission,
     );
-    -1
+    if result {
+        0
+    } else {
+        -1
+    }
 }
 
-/// YOUR JOB: Implement munmap.
-pub fn sys_munmap(_start: usize, _len: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_munmap NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// Remove one complete anonymous mapping from the current process.
+pub fn sys_munmap(start: usize, len: usize) -> isize {
+    trace!("kernel:pid[{}] sys_munmap", current_task().unwrap().pid.0);
+    if start % PAGE_SIZE != 0 {
+        return -1;
+    }
+    if len == 0 {
+        return 0;
+    }
+    let Some(raw_end) = start.checked_add(len) else {
+        return -1;
+    };
+    let Some(end) = raw_end
+        .checked_add(PAGE_SIZE - 1)
+        .map(|value| value / PAGE_SIZE * PAGE_SIZE)
+    else {
+        return -1;
+    };
+    if end > USER_VA_LIMIT {
+        return -1;
+    }
+    let task = current_task().unwrap();
+    let result = task
+        .inner_exclusive_access()
+        .memory_set
+        .munmap(VirtAddr::from(start), VirtAddr::from(end));
+    if result {
+        0
+    } else {
+        -1
+    }
 }
 
 /// change data segment size
@@ -141,21 +225,24 @@ pub fn sys_sbrk(size: i32) -> isize {
     }
 }
 
-/// YOUR JOB: Implement spawn.
-/// HINT: fork + exec =/= spawn
-pub fn sys_spawn(_path: *const u8) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_spawn NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// Create a child directly from an executable stored in the filesystem.
+pub fn sys_spawn(path: *const u8) -> isize {
+    let parent = current_task().unwrap();
+    trace!("kernel:pid[{}] sys_spawn", parent.pid.0);
+    let path = translated_str(parent.get_user_token(), path);
+    let Some(app_inode) = open_file(path.as_str(), OpenFlags::RDONLY) else {
+        return -1;
+    };
+    let data = app_inode.read_all();
+    let child = parent.spawn(data.as_slice());
+    let pid = child.pid.0;
+    add_task(child);
+    pid as isize
 }
 
-// YOUR JOB: Set task priority.
-pub fn sys_set_priority(_prio: isize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_set_priority NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// Set the current process's stride scheduling priority.
+pub fn sys_set_priority(priority: isize) -> isize {
+    let task = current_task().unwrap();
+    trace!("kernel:pid[{}] sys_set_priority", task.pid.0);
+    task.set_priority(priority)
 }
