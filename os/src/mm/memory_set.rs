@@ -266,6 +266,51 @@ impl MemorySet {
         self.page_table.translate(vpn)
     }
 
+    /// Map a page-aligned anonymous user area if none of its pages are mapped.
+    pub fn mmap(&mut self, start: VirtAddr, end: VirtAddr, permission: MapPermission) -> bool {
+        let start_vpn = start.floor();
+        let end_vpn = end.ceil();
+        for vpn in VPNRange::new(start_vpn, end_vpn) {
+            if self
+                .page_table
+                .translate(vpn)
+                .map(|pte| pte.is_valid())
+                .unwrap_or(false)
+            {
+                return false;
+            }
+        }
+        self.push(
+            MapArea::new(start, end, MapType::Framed, permission | MapPermission::U),
+            None,
+        );
+        true
+    }
+
+    /// Remove an area that exactly matches a complete mapping.
+    pub fn munmap(&mut self, start: VirtAddr, end: VirtAddr) -> bool {
+        let start_vpn = start.floor();
+        let end_vpn = end.ceil();
+        let Some(index) = self.areas.iter().position(|area| {
+            area.vpn_range.get_start() == start_vpn && area.vpn_range.get_end() == end_vpn
+        }) else {
+            return false;
+        };
+        for vpn in VPNRange::new(start_vpn, end_vpn) {
+            if !self
+                .page_table
+                .translate(vpn)
+                .map(|pte| pte.is_valid())
+                .unwrap_or(false)
+            {
+                return false;
+            }
+        }
+        let mut area = self.areas.remove(index);
+        area.unmap(&mut self.page_table);
+        true
+    }
+
     ///Remove all `MapArea`
     pub fn recycle_data_pages(&mut self) {
         self.areas.clear();

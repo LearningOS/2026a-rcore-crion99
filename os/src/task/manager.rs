@@ -23,7 +23,19 @@ impl TaskManager {
     }
     /// Take a process out of the ready queue
     pub fn fetch(&mut self) -> Option<Arc<TaskControlBlock>> {
-        self.ready_queue.pop_front()
+        let mut best = 0;
+        for index in 1..self.ready_queue.len() {
+            let candidate = self.ready_queue[index].stride();
+            let selected = self.ready_queue[best].stride();
+            // The stride spread is bounded by half the integer range. A
+            // wrapping signed difference therefore preserves circular order.
+            if (candidate.wrapping_sub(selected) as isize) < 0 {
+                best = index;
+            }
+        }
+        let task = self.ready_queue.remove(best)?;
+        task.advance_stride();
+        Some(task)
     }
 }
 
